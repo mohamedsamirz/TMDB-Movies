@@ -1,16 +1,4 @@
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from ast import literal_eval
-import re
-import os
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.feature_extraction import FeatureHasher
-from sklearn.decomposition import PCA
-from sklearn.compose import ColumnTransformer
+
 class TMDBPreprocessor:
     def __init__(self, data_path: str):
         self.data_path = data_path
@@ -33,135 +21,108 @@ class TMDBPreprocessor:
     def get_columns(self) -> list:
         """Get current dataframe columns"""
         return self.data.columns.tolist()
+    def remove_stopwords(text):
+        words = [word for word in text.split() if word.lower() not in stop_words]
+        return " ".join(words)
 
+    def lemmatize_text(text):
+        words = [lemmatizer.lemmatize(word) for word in text.split()]
+        return " ".join(words)
+    def jaccard_similarity(set1, set2):
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        return intersection / union if union != 0 else 0
     def prepare_for_modeling(self, target='revenue'):
-        available_cols = self.get_columns()
-        num_cols = self.data.select_dtypes(include=['number']).columns.tolist()
-        cat_cols = self.data.select_dtypes(include=['object']).columns.tolist()
-
-        if target in num_cols:
-            num_cols.remove(target)
-        if target in cat_cols:
-            cat_cols.remove(target)
-
-        list_cols = [col for col in cat_cols if isinstance(self.data[col].iloc[0], list)]
-
-        hasher = FeatureHasher(n_features=100, input_type='string')
-
-        def hash_column(col):
-            hashed_data = hasher.transform(self.data[col].apply(lambda x: ' '.join(x) if isinstance(x, list) else ''))
-            hashed_df = pd.DataFrame(hashed_data.toarray(), columns=[f"{col}_{i}" for i in range(hashed_data.shape[1])])
-            return hashed_df
-
-        hashed_columns = [hash_column(col) for col in list_cols]
-        self.data = pd.concat([self.data] + hashed_columns, axis=1).drop(columns=list_cols)
-
-        num_cols = [col for col in self.data.select_dtypes(include=['number']).columns.tolist() if col != target]
-        cat_cols = [col for col in self.data.select_dtypes(include=['object']).columns.tolist()]
-
-        transformers = []
-        if num_cols:
-            transformers.append(('num', StandardScaler(), num_cols))
-        if cat_cols:
-            transformers.append(('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols))
-
-        preprocessor = ColumnTransformer(
-            transformers,
-            remainder='drop'  # Force drop any leftover columns
-        )
-
+        """Prepare features and target for modeling."""
         if target not in self.data.columns:
-            raise ValueError(f"Target column '{target}' not found in data")
+            raise ValueError(f"Target column '{target}' not found in data.")
 
         features = [col for col in self.data.columns if col != target]
+
         X = self.data[features]
         y = self.data[target]
 
-        # Apply preprocessor
-        X = preprocessor.fit_transform(X)
-
-        # Ensure numeric
-        import numpy as np
-        if hasattr(X, "toarray"):
-            X = X.toarray()
-        if X.dtype == object:
-            X = np.array(X, dtype=np.float64)
-
-        # Just to be safe
-        for col in self.data.columns:
-            if self.data[col].dtype == 'object':
-                print(f"⚠️ Column '{col}' is still object type.")
-        # Now apply PCA
-        pca = PCA(n_components=0.95)
-        X = pca.fit_transform(X)
         return X, y
-    def process_genres(self):
-        """Vectorized genre processing"""
-        exploded = self.data.explode('genres')
-        genre_dummies = pd.crosstab(exploded.index, exploded['genres'])
-        genre_dummies.columns = [f'genre_{col}' for col in genre_dummies.columns]
-        self.data = self.data.join(genre_dummies.astype('int8'))
-        self.genre_columns = genre_dummies.columns.tolist()
+
+    def convert_catgories_to_numerical(self):
+        features = ['keywords', 'genres', 'overview', 'spoken_languages', 'production_countries','prduction_companies']
+        self.data[features] = self.data[features].fillna('')
+        self.data.drop_duplicates(inplace=True)
+        
+
+
+    def impute_missing_values_local(data, window=8):
+        """Impute missing values using local window: mean for numeric, mode for categorical."""
+        data = data.copy()
+        
+        num_cols = data.select_dtypes(include=["number"]).columns
+        cat_cols = data.select_dtypes(include=["object"]).columns
+
+        for col in num_cols:
+            series = data[col]
+            for idx, value in series.items():
+                if pd.isna(value):
+                    local_values = series[idx+1:idx+1+window].dropna()
+                    if not local_values.empty:
+                        series.at[idx] = local_values.mean()
+            data[col] = series
+
+        for col in cat_cols:
+            series = data[col]
+            for idx, value in series.items():
+                if pd.isna(value):
+                    local_values = series[idx+1:idx+1+window].dropna()
+                    if not local_values.empty:
+                        most_common = Counter(local_values).most_common(1)[0][0]
+                        series.at[idx] = most_common
+            data[col] = series
+
+        return data
+
+    def clean_data(self):
+        """Filter rows with status 'Released' and drop the 'status' column"""
+        self.data = self.data[self.data['status'] == 'Released']
+        self.data = self.data.drop(columns=['status'], axis=1)
+    def correct_data(self):
+        """Convert any boolean columns into 0/1 integer columns."""
+        bool_cols = self.data.select_dtypes(include=['bool']).columns
+        self.data[bool_cols] = self.data[bool_cols].astype(int)
         return self
-
-    def process_countries(self):
-        """Batch country processing"""
-        exploded = self.data.explode('production_countries')
-        top_countries = exploded['production_countries'].value_counts().head(5).index
-
-        country_dummies = pd.DataFrame({
-            f'prod_{country}': self.data['production_countries'].apply(
-                lambda x: 1 if country in x else 0
-            ) for country in top_countries
-        }).astype('int8')
-
-        self.data = pd.concat([self.data, country_dummies], axis=1)
-        self.country_columns = country_dummies.columns.tolist()
-        return self
-
-    def process_languages(self):
-        """Vectorized language processing"""
-        exploded = self.data.explode('spoken_languages')
-        lang_dummies = pd.crosstab(exploded.index, exploded['spoken_languages'])
-        lang_dummies.columns = [f'lang_{col}' for col in lang_dummies.columns]
-        self.data = self.data.join(lang_dummies.astype('int8'))
-        self.language_columns = lang_dummies.columns.tolist()
-        return self
-
-    def create_financial_features(self):
-        """Vectorized financial features"""
-        money_cols = ['budget', 'revenue']
-        self.data[money_cols] = self.data[money_cols].apply(
-            pd.to_numeric, errors='coerce'
-        ).replace(0, np.nan)
-
-        self.data['profit'] = self.data['revenue'] - self.data['budget']
-        self.data['roi'] = (self.data['profit'] / self.data['budget']).replace([np.inf, -np.inf], np.nan)
-        self.data['profitability'] = pd.cut(
-            self.data['roi'],
-            bins=[-np.inf, 0, 1, 2, np.inf],
-            labels=['Loss', 'Low', 'Medium', 'High']
-        )
-        return self
-
-    def create_temporal_features(self):
-        """Vectorized date features"""
+    def process_date(self):
+        """Convert release_date to datetime and extract year, month, and quarter"""
         self.data['release_date'] = pd.to_datetime(self.data['release_date'], errors='coerce')
         self.data['release_year'] = self.data['release_date'].dt.year
         self.data['release_month'] = self.data['release_date'].dt.month
         self.data['release_quarter'] = self.data['release_date'].dt.quarter
+        self.data = self.data.drop(columns=['release_date'], axis=1)
         return self
+    def process_original_language(self, top_n=5):
+        """One-hot encode top N most common original_language entries, group others as 'other'."""
 
-    def impute_missing_values(self):
-        """Batch dynamic imputation"""
-        num_imputer = SimpleImputer(strategy='median')
-        cat_imputer = SimpleImputer(strategy='most_frequent')
+        print("Processing 'original_language' column...")
 
-        num_cols = self.data.select_dtypes(include=["number"]).columns
-        cat_cols = self.data.select_dtypes(include=["object"]).columns
+        # Fill missing with 'other'
+        self.data['original_language'] = self.data['original_language'].fillna('other')
 
-        self.data[num_cols] = num_imputer.fit_transform(self.data[num_cols])
-        self.data[cat_cols] = cat_imputer.fit_transform(self.data[cat_cols])
+        # Find top N most common languages
+        top_languages = self.data['original_language'].value_counts().nlargest(top_n).index.tolist()
+        print(f"Top {top_n} languages: {top_languages}")
+
+        # Replace rare languages with 'other'
+        self.data['original_language'] = self.data['original_language'].apply(
+            lambda x: x if x in top_languages else 'other'
+        )
+
+        # One-hot encode
+        lang_dummies = pd.get_dummies(self.data['original_language'], prefix='lang')
+        print(f"Adding {lang_dummies.shape[1]} language columns.")
+
+        # Concatenate back to original data
+        self.data = pd.concat([self.data, lang_dummies], axis=1)
+
+        # Drop the original column
+        self.data = self.data.drop(columns=['original_language'])
+
         return self
 
     def handle_outliers(self):
@@ -178,18 +139,11 @@ class TMDBPreprocessor:
 
     def process_data(self, save_path=None):
         """Optimized end-to-end workflow"""
-        (self.process_genres()
-            .process_countries()
-            .process_languages()
-            .create_financial_features()
-            .create_temporal_features()
-            .impute_missing_values()
+        (self.clean_data()
+            .process_date()
+            .convert_catgories_to_numerical()
+            .impute_missing_values_local()
             .handle_outliers())
-
-        # Optimize memory usage (only for one-hot encoded features)
-        self.data = self.data.astype({
-            col: 'int8' for col in self.genre_columns + self.country_columns + self.language_columns
-        })
 
         if save_path:
             self.save_data(save_path)
